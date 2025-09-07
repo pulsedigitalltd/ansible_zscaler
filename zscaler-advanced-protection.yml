@@ -1,0 +1,496 @@
+---
+- name: Advanced Zscaler Tamper Protection
+  hosts: all
+  become: yes
+  vars:
+    monitoring_email: "{{ vault_monitoring_email }}"
+    slack_webhook: "{{ vault_slack_webhook }}"
+    
+  tasks:
+    - name: Install monitoring dependencies (Linux)
+      package:
+        name:
+          - inotify-tools
+          - auditd
+        state: present
+      when: ansible_os_family != "Darwin"
+      
+    - name: Configure audit rules for Zscaler files (Linux)
+      lineinfile:
+        path: /etc/audit/rules.d/99-zscaler.rules
+        line: "{{ item }}"
+        create: yes
+        owner: root
+        group: root
+        mode: '0600'
+      loop:
+        - '-w /opt/zscaler/ -p wa -k zscaler_files'
+        - '-w /etc/systemd/system/zscaler.service -p wa -k zscaler_service'
+        - '-w /usr/local/bin/zscaler-protection.sh -p wa -k zscaler_protection'
+      when: ansible_os_family != "Darwin"
+      notify: restart auditd
+      
+    - name: Create comprehensive tamper protection script (Linux)
+      copy:
+        content: |
+          #!/bin/bash
+          # Advanced Zscaler Tamper Protection
+          
+          set -euo pipefail
+          
+          # Configuration
+          ZSCALER_SERVICE="zscaler"
+          ZSCALER_BINARY="/opt/zscaler/bin/zscaler"
+          ZSCALER_CONFIG_DIR="/opt/zscaler/conf"
+          LOG_FILE="/var/log/zscaler-protection.log"
+          ALERT_EMAIL="{{ monitoring_email }}"
+          SLACK_WEBHOOK="{{ slack_webhook }}"
+          LOCKFILE="/var/run/zscaler-protection.lock"
+          
+          # Logging with severity levels
+          log_message() {
+              local severity="$1"
+              local message="$2"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') [$severity] $message" >> "$LOG_FILE"
+              logger -p daemon.$severity -t zscaler-protection "$message"
+          }
+          
+          # Send alert function
+          send_alert() {
+              local message="$1"
+              local hostname=$(hostname)
+              
+              # Email alert
+              if [[ -n "$ALERT_EMAIL" ]] && command -v mail >/dev/null; then
+                  echo "$message" | mail -s "Zscaler Alert - $hostname" "$ALERT_EMAIL"
+              fi
+              
+              # Slack alert
+              if [[ -n "$SLACK_WEBHOOK" ]] && command -v curl >/dev/null; then
+                  curl -X POST -H 'Content-type: application/json' \
+                      --data "{\"text\":\"🚨 Zscaler Alert on $hostname: $message\"}" \
+                      "$SLACK_WEBHOOK" 2>/dev/null || true
+              fi
+          }
+          
+          # Prevent concurrent execution
+          exec 200>"$LOCKFILE"
+          if ! flock -n 200; then
+              log_message "warning" "Another instance is running, exiting"
+              exit 0
+          fi
+          
+          # Check service status with detailed analysis
+          check_service_status() {
+              if ! systemctl is-active --quiet "$ZSCALER_SERVICE"; then
+                  local exit_code=$(systemctl show "$ZSCALER_SERVICE" --property=ExecMainStatus --value)
+                  log_message "critical" "Zscaler service is down (exit code: $exit_code)"
+                  
+                  # Attempt restart
+                  if systemctl start "$ZSCALER_SERVICE"; then
+                      log_message "info" "Zscaler service successfully restarted"
+                      send_alert "Zscaler service was down but has been restarted"
+                  else
+                      log_message "critical" "Failed to restart Zscaler service"
+                      send_alert "CRITICAL: Failed to restart Zscaler service"
+                      return 1
+                  fi
+              fi
+          }
+          
+          # Check binary integrity
+          check_binary_integrity() {
+              if [[ ! -f "$ZSCALER_BINARY" ]]; then
+                  log_message "critical" "Zscaler binary is missing"
+                  send_alert "CRITICAL: Zscaler binary has been deleted"
+                  touch /tmp/zscaler-reinstall-needed
+                  return 1
+              fi
+              
+              # Check if binary is executable
+              if [[ ! -x "$ZSCALER_BINARY" ]]; then
+                  log_message "warning" "Zscaler binary is not executable, fixing permissions"
+                  chmod +x "$ZSCALER_BINARY"
+              fi
+              
+              # Verify binary hasn't been replaced (simple size check)
+              local current_size=$(stat -f%z "$ZSCALER_BINARY" 2>/dev/null || stat -c%s "$ZSCALER_BINARY")
+              local expected_size_file="/var/lib/zscaler/.binary_size"
+              
+              if [[ -f "$expected_size_file" ]]; then
+                  local expected_size=$(cat "$expected_size_file")
+                  if [[ "$current_size" != "$expected_size" ]]; then
+                      log_message "critical" "Zscaler binary size mismatch - possible tampering"
+                      send_alert "CRITICAL: Zscaler binary may have been tampered with"
+                  fi
+              else
+                  echo "$current_size" > "$expected_size_file"
+              fi
+          }
+          
+          # Check configuration integrity
+          check_config_integrity() {
+              for config_file in "$ZSCALER_CONFIG_DIR"/{appprofile,userdomain}; do
+                  if [[ ! -f "$config_file" ]]; then
+                      log_message "critical" "Configuration file missing: $config_file"
+                      send_alert "CRITICAL: Zscaler configuration file deleted: $config_file"
+                      continue
+                  fi
+                  
+                  # Check permissions
+                  local perms=$(stat -f%Lp "$config_file" 2>/dev/null || stat -c%a "$config_file")
+                  if [[ "$perms" != "600" ]]; then
+                      log_message "warning" "Fixing permissions for $config_file"
+                      chmod 600 "$config_file"
+                  fi
+                  
+                  # Check ownership
+                  if [[ $(stat -f%Su "$config_file" 2>/dev/null || stat -c%U "$config_file") != "root" ]]; then
+                      log_message "warning" "Fixing ownership for $config_file"
+                      chown root:root "$config_file"
+                  fi
+              done
+          }
+          
+          # Check network connectivity to Zscaler cloud
+          check_network_connectivity() {
+              local zscaler_cloud=$(grep -o '<ServerName>[^<]*</ServerName>' "$ZSCALER_CONFIG_DIR/appprofile" | sed 's/<[^>]*>//g' | head -1)
+              
+              if [[ -n "$zscaler_cloud" ]]; then
+                  if ! ping -c 1 -W 5 "$zscaler_cloud" >/dev/null 2>&1; then
+                      log_message "warning" "Cannot reach Zscaler cloud: $zscaler_cloud"
+                  fi
+              fi
+          }
+          
+          # Check for bypass attempts
+          check_bypass_attempts() {
+              # Check for common bypass methods
+              local suspicious_processes=(
+                  "proxychains"
+                  "tor"
+                  "shadowsocks"
+                  "v2ray"
+                  "clash"
+              )
+              
+              for process in "${suspicious_processes[@]}"; do
+                  if pgrep -f "$process" >/dev/null; then
+                      log_message "warning" "Suspicious process detected: $process"
+                      send_alert "WARNING: Potential bypass attempt detected - process: $process"
+                  fi
+              done
+              
+              # Check for DNS changes
+              if ! grep -q "nameserver 127.0.0.1" /etc/resolv.conf; then
+                  log_message "warning" "DNS configuration may have been modified"
+              fi
+          }
+          
+          # Main execution
+          main() {
+              log_message "info" "Starting tamper protection check"
+              
+              check_service_status || true
+              check_binary_integrity || true
+              check_config_integrity || true
+              check_network_connectivity || true
+              check_bypass_attempts || true
+              
+              log_message "info" "Tamper protection check completed"
+          }
+          
+          # Cleanup on exit
+          cleanup() {
+              flock -u 200
+          }
+          trap cleanup EXIT
+          
+          main "$@"
+        dest: /usr/local/bin/zscaler-advanced-protection.sh
+        mode: '0755'
+        owner: root
+        group: root
+      when: ansible_os_family != "Darwin"
+      
+    - name: Create comprehensive tamper protection script (macOS)
+      copy:
+        content: |
+          #!/bin/bash
+          # Advanced Zscaler Tamper Protection for macOS
+          
+          set -euo pipefail
+          
+          # Configuration
+          ZSCALER_APP="/Applications/Zscaler/Zscaler.app"
+          ZSCALER_CONFIG_DIR="/Library/Application Support/Zscaler"
+          LOG_FILE="/var/log/zscaler-protection.log"
+          ALERT_EMAIL="{{ monitoring_email }}"
+          SLACK_WEBHOOK="{{ slack_webhook }}"
+          LOCKFILE="/tmp/zscaler-protection.lock"
+          
+          # Logging function
+          log_message() {
+              local severity="$1"
+              local message="$2"
+              echo "$(date '+%Y-%m-%d %H:%M:%S') [$severity] $message" >> "$LOG_FILE"
+              logger -p daemon.$severity -t zscaler-protection "$message"
+          }
+          
+          # Send alert function
+          send_alert() {
+              local message="$1"
+              local hostname=$(hostname)
+              
+              # Email alert via mail command
+              if [[ -n "$ALERT_EMAIL" ]] && command -v mail >/dev/null; then
+                  echo "$message" | mail -s "Zscaler Alert - $hostname" "$ALERT_EMAIL"
+              fi
+              
+              # Slack alert
+              if [[ -n "$SLACK_WEBHOOK" ]] && command -v curl >/dev/null; then
+                  curl -X POST -H 'Content-type: application/json' \
+                      --data "{\"text\":\"🚨 Zscaler Alert on $hostname: $message\"}" \
+                      "$SLACK_WEBHOOK" 2>/dev/null || true
+              fi
+              
+              # macOS notification
+              osascript -e "display notification \"$message\" with title \"Zscaler Alert\"" 2>/dev/null || true
+          }
+          
+          # Prevent concurrent execution
+          exec 200>"$LOCKFILE"
+          if ! flock -n 200; then
+              log_message "warning" "Another instance is running, exiting"
+              exit 0
+          fi
+          
+          # Check application status
+          check_app_status() {
+              if [[ ! -d "$ZSCALER_APP" ]]; then
+                  log_message "critical" "Zscaler application is missing"
+                  send_alert "CRITICAL: Zscaler application has been deleted"
+                  touch /tmp/zscaler-reinstall-needed
+                  return 1
+              fi
+              
+              # Check if process is running
+              if ! pgrep -f "Zscaler.app" >/dev/null; then
+                  log_message "critical" "Zscaler process is not running"
+                  
+                  # Attempt to restart via LaunchDaemon
+                  if launchctl load -w /Library/LaunchDaemons/com.zscaler.client.connector.plist 2>/dev/null; then
+                      sleep 5
+                      if pgrep -f "Zscaler.app" >/dev/null; then
+                          log_message "info" "Zscaler successfully restarted"
+                          send_alert "Zscaler was down but has been restarted"
+                      else
+                          log_message "critical" "Failed to restart Zscaler"
+                          send_alert "CRITICAL: Failed to restart Zscaler"
+                      fi
+                  fi
+              fi
+          }
+          
+          # Check system extension status
+          check_system_extension() {
+              if ! systemextensionsctl list | grep -q "Zscaler"; then
+                  log_message "warning" "Zscaler system extension not found"
+                  send_alert "WARNING: Zscaler system extension may be disabled"
+              fi
+          }
+          
+          # Check configuration integrity
+          check_config_integrity() {
+              for config_file in "$ZSCALER_CONFIG_DIR"/{appprofile,userdomain}; do
+                  if [[ ! -f "$config_file" ]]; then
+                      log_message "critical" "Configuration file missing: $config_file"
+                      send_alert "CRITICAL: Zscaler configuration file deleted: $config_file"
+                      continue
+                  fi
+                  
+                  # Reset permissions and ownership
+                  chown root:wheel "$config_file"
+                  chmod 600 "$config_file"
+                  
+                  # Re-apply file flags if removed
+                  if ! ls -lO "$config_file" | grep -q "uchg"; then
+                      log_message "warning" "Reapplying immutable flag to $config_file"
+                      chflags uchg "$config_file"
+                  fi
+              done
+          }
+          
+          # Check for bypass attempts
+          check_bypass_attempts() {
+              # Check for VPN applications
+              local vpn_apps=(
+                  "NordVPN"
+                  "ExpressVPN"
+                  "Surfshark"
+                  "ProtonVPN"
+                  "Tunnelblick"
+              )
+              
+              for app in "${vpn_apps[@]}"; do
+                  if [[ -d "/Applications/$app.app" ]] && pgrep -f "$app" >/dev/null; then
+                      log_message "warning" "VPN application running: $app"
+                      send_alert "WARNING: VPN application detected: $app"
+                  fi
+              done
+              
+              # Check for proxy settings
+              if networksetup -getproxyserver "Wi-Fi" 2>/dev/null | grep -v "No" | grep -q "."; then
+                  log_message "warning" "Manual proxy configuration detected"
+                  send_alert "WARNING: Manual proxy settings detected"
+              fi
+          }
+          
+          # Main execution
+          main() {
+              log_message "info" "Starting advanced tamper protection check"
+              
+              check_app_status || true
+              check_system_extension || true
+              check_config_integrity || true
+              check_bypass_attempts || true
+              
+              log_message "info" "Advanced tamper protection check completed"
+          }
+          
+          # Cleanup on exit
+          cleanup() {
+              flock -u 200 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          
+          main "$@"
+        dest: /usr/local/bin/zscaler-advanced-protection.sh
+        mode: '0755'
+        owner: root
+        group: wheel
+      when: ansible_os_family == "Darwin"
+      
+    - name: Create file integrity monitoring script
+      copy:
+        content: |
+          #!/bin/bash
+          # Zscaler File Integrity Monitor
+          
+          CHECKSUM_FILE="/var/lib/zscaler/.file_checksums"
+          ZSCALER_FILES=(
+              "{{ '/opt/zscaler/bin/zscaler' if ansible_os_family != 'Darwin' else '/Applications/Zscaler/Zscaler.app/Contents/MacOS/Zscaler' }}"
+              "{{ '/opt/zscaler/conf/appprofile' if ansible_os_family != 'Darwin' else '/Library/Application Support/Zscaler/appprofile' }}"
+              "{{ '/opt/zscaler/conf/userdomain' if ansible_os_family != 'Darwin' else '/Library/Application Support/Zscaler/userdomain' }}"
+          )
+          
+          # Generate checksums for first run
+          if [[ ! -f "$CHECKSUM_FILE" ]]; then
+              mkdir -p "$(dirname "$CHECKSUM_FILE")"
+              for file in "${ZSCALER_FILES[@]}"; do
+                  if [[ -f "$file" ]]; then
+                      {{ 'sha256sum' if ansible_os_family != 'Darwin' else 'shasum -a 256' }} "$file" >> "$CHECKSUM_FILE"
+                  fi
+              done
+              exit 0
+          fi
+          
+          # Check for changes
+          TEMP_CHECKSUMS="/tmp/zscaler_current_checksums"
+          for file in "${ZSCALER_FILES[@]}"; do
+              if [[ -f "$file" ]]; then
+                  {{ 'sha256sum' if ansible_os_family != 'Darwin' else 'shasum -a 256' }} "$file" >> "$TEMP_CHECKSUMS"
+              fi
+          done
+          
+          if ! diff -q "$CHECKSUM_FILE" "$TEMP_CHECKSUMS" >/dev/null 2>&1; then
+              logger -p daemon.critical -t zscaler-integrity "File integrity violation detected"
+              # Trigger reinstall or alert
+              touch /tmp/zscaler-integrity-violation
+          fi
+          
+          rm -f "$TEMP_CHECKSUMS"
+        dest: /usr/local/bin/zscaler-integrity-monitor.sh
+        mode: '0755'
+        owner: root
+        group: "{{ 'root' if ansible_os_family != 'Darwin' else 'wheel' }}"
+        
+    - name: Update advanced protection timer (Linux)
+      copy:
+        content: |
+          [Unit]
+          Description=Advanced Zscaler Protection Check
+          
+          [Timer]
+          OnBootSec=1min
+          OnUnitActiveSec=2min
+          Persistent=true
+          
+          [Install]
+          WantedBy=timers.target
+        dest: /etc/systemd/system/zscaler-advanced-protection.timer
+      when: ansible_os_family != "Darwin"
+      
+    - name: Update advanced protection service (Linux)
+      copy:
+        content: |
+          [Unit]
+          Description=Advanced Zscaler Protection Service
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/zscaler-advanced-protection.sh
+          User=root
+          StandardOutput=journal
+          StandardError=journal
+        dest: /etc/systemd/system/zscaler-advanced-protection.service
+      when: ansible_os_family != "Darwin"
+      
+    - name: Create advanced protection daemon (macOS)
+      copy:
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.company.zscaler.advanced.protection</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/usr/local/bin/zscaler-advanced-protection.sh</string>
+              </array>
+              <key>StartInterval</key>
+              <integer>120</integer>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>UserName</key>
+              <string>root</string>
+              <key>StandardOutPath</key>
+              <string>/var/log/zscaler-advanced-protection.log</string>
+              <key>StandardErrorPath</key>
+              <string>/var/log/zscaler-advanced-protection.log</string>
+          </dict>
+          </plist>
+        dest: /Library/LaunchDaemons/com.company.zscaler.advanced.protection.plist
+        owner: root
+        group: wheel
+        mode: '0644'
+      when: ansible_os_family == "Darwin"
+      
+    - name: Enable advanced protection (Linux)
+      systemd:
+        name: zscaler-advanced-protection.timer
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      when: ansible_os_family != "Darwin"
+      
+    - name: Load advanced protection daemon (macOS)
+      command: launchctl load -w /Library/LaunchDaemons/com.company.zscaler.advanced.protection.plist
+      when: ansible_os_family == "Darwin"
+      
+  handlers:
+    - name: restart auditd
+      service:
+        name: auditd
+        state: restarted

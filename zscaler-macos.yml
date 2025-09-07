@@ -1,0 +1,275 @@
+---
+- name: Install and Configure Zscaler Client Connector on macOS
+  hosts: macos_clients
+  become: yes
+  vars:
+    zscaler_version: "4.2.0"  # Update as needed
+    zscaler_download_url: "https://d32a6ru7mhaq0c.cloudfront.net/Zscaler-osx-{{ zscaler_version }}-installer.app.zip"
+    zscaler_root_cert_url: "{{ vault_zscaler_root_cert_url }}"
+    zscaler_app_profile: "{{ vault_zscaler_app_profile }}"
+    zscaler_user_domain: "{{ vault_zscaler_user_domain }}"
+    
+  tasks:
+    - name: Check if running on macOS
+      fail:
+        msg: "This playbook is designed for macOS only"
+      when: ansible_os_family != "Darwin"
+      
+    - name: Install required tools via Homebrew
+      homebrew:
+        name:
+          - curl
+          - wget
+        state: present
+      become_user: "{{ ansible_user }}"
+      
+    - name: Create temp directory for downloads
+      file:
+        path: /tmp/zscaler-install
+        state: directory
+        mode: '0755'
+        
+    - name: Download Zscaler installer
+      get_url:
+        url: "{{ zscaler_download_url }}"
+        dest: /tmp/zscaler-install/zscaler-installer.zip
+        timeout: 300
+        
+    - name: Extract Zscaler installer
+      unarchive:
+        src: /tmp/zscaler-install/zscaler-installer.zip
+        dest: /tmp/zscaler-install/
+        remote_src: yes
+        
+    - name: Find installer app
+      find:
+        paths: /tmp/zscaler-install
+        patterns: "*.app"
+        file_type: directory
+      register: installer_app
+      
+    - name: Check if Zscaler is already installed
+      stat:
+        path: /Applications/Zscaler/Zscaler.app
+      register: zscaler_installed
+      
+    - name: Quit existing Zscaler application
+      command: osascript -e 'quit app "Zscaler"'
+      ignore_errors: yes
+      when: zscaler_installed.stat.exists
+      
+    - name: Install Zscaler using installer
+      command: |
+        installer -pkg "{{ installer_app.files[0].path }}/Contents/Resources/Zscaler Client Connector.pkg" -target /
+      when: installer_app.files | length > 0
+      
+    - name: Download Zscaler root certificate
+      get_url:
+        url: "{{ zscaler_root_cert_url }}"
+        dest: /tmp/zscaler-root-ca.crt
+        mode: '0644'
+        
+    - name: Install Zscaler root certificate in System Keychain
+      command: |
+        security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/zscaler-root-ca.crt
+      ignore_errors: yes
+      
+    - name: Create Zscaler configuration directory
+      file:
+        path: /Library/Application Support/Zscaler
+        state: directory
+        owner: root
+        group: wheel
+        mode: '0755'
+        
+    - name: Deploy Zscaler application profile
+      copy:
+        content: "{{ zscaler_app_profile }}"
+        dest: "/Library/Application Support/Zscaler/appprofile"
+        owner: root
+        group: wheel
+        mode: '0600'
+        
+    - name: Deploy Zscaler user domain configuration
+      copy:
+        content: "{{ zscaler_user_domain }}"
+        dest: "/Library/Application Support/Zscaler/userdomain"
+        owner: root
+        group: wheel
+        mode: '0600'
+        
+    - name: Create Zscaler launch daemon for auto-start
+      copy:
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.zscaler.client.connector</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/Applications/Zscaler/Zscaler.app/Contents/MacOS/Zscaler</string>
+                  <string>-autostart</string>
+              </array>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>KeepAlive</key>
+              <true/>
+              <key>UserName</key>
+              <string>root</string>
+          </dict>
+          </plist>
+        dest: /Library/LaunchDaemons/com.zscaler.client.connector.plist
+        owner: root
+        group: wheel
+        mode: '0644'
+        
+    - name: Create tamper protection script for macOS
+      copy:
+        content: |
+          #!/bin/bash
+          # Zscaler Tamper Protection Script for macOS
+          
+          ZSCALER_APP="/Applications/Zscaler/Zscaler.app"
+          LOG_FILE="/var/log/zscaler-protection.log"
+          LAUNCHD_PLIST="/Library/LaunchDaemons/com.zscaler.client.connector.plist"
+          
+          log_message() {
+              echo "$(date): $1" >> "$LOG_FILE"
+          }
+          
+          # Check if Zscaler app exists
+          if [ ! -d "$ZSCALER_APP" ]; then
+              log_message "Zscaler application missing"
+              # Create flag for reinstallation
+              touch /tmp/zscaler-reinstall-needed
+              exit 1
+          fi
+          
+          # Check if Zscaler process is running
+          if ! pgrep -f "Zscaler.app" > /dev/null; then
+              log_message "Zscaler not running, attempting restart"
+              launchctl load -w "$LAUNCHD_PLIST" 2>/dev/null
+              sleep 5
+              if pgrep -f "Zscaler.app" > /dev/null; then
+                  log_message "Zscaler successfully restarted"
+              else
+                  log_message "Failed to restart Zscaler"
+              fi
+          fi
+          
+          # Reset permissions
+          chown -R root:wheel "/Library/Application Support/Zscaler"
+          chmod 600 "/Library/Application Support/Zscaler/appprofile"
+          chmod 600 "/Library/Application Support/Zscaler/userdomain"
+          
+          # Ensure launch daemon is loaded
+          if ! launchctl list | grep -q "com.zscaler.client.connector"; then
+              log_message "Loading Zscaler launch daemon"
+              launchctl load -w "$LAUNCHD_PLIST"
+          fi
+          
+        dest: /usr/local/bin/zscaler-protection.sh
+        mode: '0755'
+        owner: root
+        group: wheel
+        
+    - name: Create launch daemon for tamper protection
+      copy:
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>com.company.zscaler.protection</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/usr/local/bin/zscaler-protection.sh</string>
+              </array>
+              <key>StartInterval</key>
+              <integer>300</integer>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>UserName</key>
+              <string>root</string>
+          </dict>
+          </plist>
+        dest: /Library/LaunchDaemons/com.company.zscaler.protection.plist
+        owner: root
+        group: wheel
+        mode: '0644'
+        
+    - name: Create System Extension approval configuration
+      copy:
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>SystemExtensions</key>
+              <dict>
+                  <key>AllowedSystemExtensions</key>
+                  <dict>
+                      <key>53993E20-C6A8-3A78-8B95-849C3412E35D</key>
+                      <array>
+                          <string>53993E20-C6A8-3A78-8B95-849C3412E35D.ZscalerTunnel</string>
+                      </array>
+                  </dict>
+              </dict>
+          </dict>
+          </plist>
+        dest: /Library/Application Support/com.apple.TCC/SystemPolicy.db.plist
+        owner: root
+        group: wheel
+        mode: '0644'
+      ignore_errors: yes
+      
+    - name: Create firewall rules using pfctl
+      copy:
+        content: |
+          # Zscaler traffic enforcement rules
+          # Block direct DNS to prevent bypass
+          block out quick on any inet proto udp from any to { 8.8.8.8, 1.1.1.1, 208.67.222.222 } port 53
+          block out quick on any inet proto tcp from any to { 8.8.8.8, 1.1.1.1, 208.67.222.222 } port 53
+          
+          # Allow Zscaler traffic
+          pass out quick on any inet proto tcp from any to any port { 80, 443, 9443 }
+        dest: /etc/pf.anchors/zscaler.rules
+        owner: root
+        group: wheel
+        mode: '0644'
+        
+    - name: Load firewall rules
+      command: pfctl -f /etc/pf.anchors/zscaler.rules
+      ignore_errors: yes
+      
+    - name: Load Zscaler launch daemon
+      command: launchctl load -w /Library/LaunchDaemons/com.zscaler.client.connector.plist
+      
+    - name: Load tamper protection daemon
+      command: launchctl load -w /Library/LaunchDaemons/com.company.zscaler.protection.plist
+      
+    - name: Set file flags to prevent deletion
+      command: chflags uchg "{{ item }}"
+      loop:
+        - "/Library/Application Support/Zscaler/appprofile"
+        - "/Library/Application Support/Zscaler/userdomain"
+        - "/Library/LaunchDaemons/com.zscaler.client.connector.plist"
+      ignore_errors: yes
+      
+    - name: Start Zscaler application
+      command: open -a "/Applications/Zscaler/Zscaler.app"
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+      
+    - name: Clean up temporary files
+      file:
+        path: /tmp/zscaler-install
+        state: absent
+        
+    - name: Remove certificate temp file
+      file:
+        path: /tmp/zscaler-root-ca.crt
+        state: absent

@@ -1,0 +1,224 @@
+---
+- name: Install and Configure Zscaler Client Connector on Linux
+  hosts: linux_clients
+  become: yes
+  vars:
+    zscaler_version: "4.2.0"  # Update as needed
+    zscaler_download_url: "https://d32a6ru7mhaq0c.cloudfront.net/Zscaler-linux_{{ zscaler_version }}-installer.run"
+    zscaler_root_cert_url: "{{ vault_zscaler_root_cert_url }}"  # Store in Ansible Vault
+    zscaler_app_profile: "{{ vault_zscaler_app_profile }}"      # Store in Ansible Vault
+    zscaler_user_domain: "{{ vault_zscaler_user_domain }}"      # Store in Ansible Vault
+    
+  tasks:
+    - name: Create zscaler user for service isolation
+      user:
+        name: zscaler
+        system: yes
+        shell: /bin/false
+        home: /var/lib/zscaler
+        create_home: yes
+        
+    - name: Install required dependencies
+      package:
+        name:
+          - curl
+          - systemd
+          - iptables
+          - net-tools
+        state: present
+        
+    - name: Download Zscaler installer
+      get_url:
+        url: "{{ zscaler_download_url }}"
+        dest: "/tmp/zscaler-installer.run"
+        mode: '0755'
+        timeout: 300
+        
+    - name: Check if Zscaler is already installed
+      stat:
+        path: /opt/zscaler/bin/zscaler
+      register: zscaler_installed
+      
+    - name: Stop Zscaler service before update
+      systemd:
+        name: zscaler
+        state: stopped
+      when: zscaler_installed.stat.exists
+      ignore_errors: yes
+      
+    - name: Install/Update Zscaler Client Connector
+      shell: |
+        /tmp/zscaler-installer.run -- -i silent
+      args:
+        creates: /opt/zscaler/bin/zscaler
+      register: zscaler_install_result
+      
+    - name: Download and install Zscaler root certificate
+      get_url:
+        url: "{{ zscaler_root_cert_url }}"
+        dest: /usr/local/share/ca-certificates/zscaler-root-ca.crt
+        mode: '0644'
+      register: cert_downloaded
+      
+    - name: Update CA certificates
+      command: update-ca-certificates
+      when: cert_downloaded.changed
+      
+    - name: Create Zscaler configuration directory
+      file:
+        path: /opt/zscaler/conf
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+        
+    - name: Deploy Zscaler application profile
+      copy:
+        content: "{{ zscaler_app_profile }}"
+        dest: /opt/zscaler/conf/appprofile
+        owner: root
+        group: root
+        mode: '0600'
+        backup: yes
+        
+    - name: Create Zscaler user domain configuration
+      copy:
+        content: "{{ zscaler_user_domain }}"
+        dest: /opt/zscaler/conf/userdomain
+        owner: root
+        group: root
+        mode: '0600'
+        
+    - name: Create tamper protection script
+      copy:
+        content: |
+          #!/bin/bash
+          # Zscaler Tamper Protection Script
+          
+          ZSCALER_SERVICE="zscaler"
+          ZSCALER_BINARY="/opt/zscaler/bin/zscaler"
+          LOG_FILE="/var/log/zscaler-protection.log"
+          
+          log_message() {
+              echo "$(date): $1" >> "$LOG_FILE"
+          }
+          
+          # Check if Zscaler service is running
+          if ! systemctl is-active --quiet "$ZSCALER_SERVICE"; then
+              log_message "Zscaler service stopped, attempting restart"
+              systemctl start "$ZSCALER_SERVICE"
+              if systemctl is-active --quiet "$ZSCALER_SERVICE"; then
+                  log_message "Zscaler service successfully restarted"
+              else
+                  log_message "Failed to restart Zscaler service"
+              fi
+          fi
+          
+          # Check if Zscaler binary exists
+          if [ ! -f "$ZSCALER_BINARY" ]; then
+              log_message "Zscaler binary missing, triggering reinstall"
+              # Trigger ansible reinstall or alert
+              touch /tmp/zscaler-reinstall-needed
+          fi
+          
+          # Reset file permissions if tampered
+          chown -R root:root /opt/zscaler
+          chmod -R 755 /opt/zscaler/bin
+          chmod -R 600 /opt/zscaler/conf
+          
+        dest: /usr/local/bin/zscaler-protection.sh
+        mode: '0755'
+        owner: root
+        group: root
+        
+    - name: Create systemd timer for tamper protection
+      copy:
+        content: |
+          [Unit]
+          Description=Zscaler Protection Check
+          
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=5min
+          Persistent=true
+          
+          [Install]
+          WantedBy=timers.target
+        dest: /etc/systemd/system/zscaler-protection.timer
+        
+    - name: Create systemd service for tamper protection
+      copy:
+        content: |
+          [Unit]
+          Description=Zscaler Protection Service
+          
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/zscaler-protection.sh
+          User=root
+          StandardOutput=journal
+          StandardError=journal
+        dest: /etc/systemd/system/zscaler-protection.service
+        
+    - name: Create iptables rules to prevent bypass
+      iptables:
+        chain: OUTPUT
+        destination: "{{ item }}"
+        jump: REJECT
+        comment: "Block direct internet access - force through Zscaler"
+      loop:
+        - "8.8.8.8"
+        - "1.1.1.1"
+        - "208.67.222.222"
+      tags: firewall
+      
+    - name: Save iptables rules
+      shell: |
+        iptables-save > /etc/iptables/rules.v4
+      args:
+        creates: /etc/iptables/rules.v4
+      tags: firewall
+      
+    - name: Enable and start Zscaler service
+      systemd:
+        name: zscaler
+        enabled: yes
+        state: started
+        daemon_reload: yes
+        
+    - name: Enable tamper protection timer
+      systemd:
+        name: zscaler-protection.timer
+        enabled: yes
+        state: started
+        daemon_reload: yes
+        
+    - name: Create file integrity monitoring
+      cron:
+        name: "Zscaler file integrity check"
+        minute: "*/10"
+        job: "find /opt/zscaler -type f -newer /tmp/zscaler-last-check 2>/dev/null && echo 'Zscaler files modified' | logger -t zscaler-integrity; touch /tmp/zscaler-last-check"
+        user: root
+        
+    - name: Restrict access to Zscaler configuration
+      file:
+        path: "{{ item }}"
+        owner: root
+        group: root
+        mode: '0600'
+        attributes: +i  # Make immutable
+      loop:
+        - /opt/zscaler/conf/appprofile
+        - /opt/zscaler/conf/userdomain
+      ignore_errors: yes  # In case chattr not available
+      
+    - name: Remove installer file
+      file:
+        path: /tmp/zscaler-installer.run
+        state: absent
+        
+  handlers:
+    - name: restart zscaler
+      systemd:
+        name: zscaler
+        state: restarted
